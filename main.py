@@ -148,3 +148,80 @@ mean_teacher_predictions = mean_teacher_sgd.predict(X_labeled_test)
 mean_teacher_accuracy = accuracy_score(y_labeled_test, mean_teacher_predictions)
 
 mean_teacher_accuracy
+
+
+class MeanTeacherSGDClassifier:
+    def __init__(self, learning_rate=0.01, n_iter=1000, alpha=0.0001, ema_decay=0.99, loss='log', verbose=False, consistency_threshold=0.9, alpha_weight=0.5):
+        self.student = SGDClassifier(learning_rate=learning_rate, n_iter=n_iter, penalty='l2', alpha=alpha, loss=loss, verbose=verbose)
+        self.teacher = SGDClassifier(learning_rate=learning_rate, n_iter=n_iter, penalty='l2', alpha=alpha, loss=loss, verbose=False)
+        self.ema_decay = ema_decay
+        self.loss = loss
+        self.verbose = verbose
+        self.consistency_threshold = consistency_threshold
+        self.alpha_weight = alpha_weight
+
+    def _update_teacher(self):
+        self.teacher.weights = self.ema_decay * self.teacher.weights + (1 - self.ema_decay) * self.student.weights
+        self.teacher.bias = self.ema_decay * self.teacher.bias + (1 - self.ema_decay) * self.student.bias
+
+    def _consistency_loss(self, X_unlabeled):
+        teacher_preds = self.teacher.predict_proba(X_unlabeled)
+        student_preds = self.student.predict_proba(X_unlabeled)
+        
+        mask = teacher_preds > self.consistency_threshold
+        if np.sum(mask) == 0:
+            return 0.0  # No samples meet the threshold criteria
+        consistency_loss = np.mean((teacher_preds[mask] - student_preds[mask]) ** 2)
+        return consistency_loss
+
+    def _compute_combined_gradient(self, X_labeled, y_labeled, X_unlabeled):
+        dW_labeled, db_labeled = self.student._compute_gradient(X_labeled, y_labeled)
+        
+        teacher_preds = self.teacher.predict_proba(X_unlabeled)
+        confident_mask = teacher_preds > self.consistency_threshold
+        if np.sum(confident_mask) > 0:
+            X_confident = X_unlabeled[confident_mask]
+            y_confident = np.sign(teacher_preds[confident_mask] - 0.5)  # Teacher's confident predictions as pseudo-labels
+            dW_unlabeled, db_unlabeled = self.student._compute_gradient(X_confident, y_confident)
+            
+            dW = dW_labeled + dW_unlabeled
+            db = db_labeled + db_unlabeled
+        else:
+            dW = dW_labeled
+            db = db_labeled
+        
+        return dW, db
+
+    def fit(self, X_labeled, y_labeled, X_unlabeled):
+        n_samples, n_features = X_labeled.shape
+        self.student._initialize_weights(n_features)
+        self.teacher._initialize_weights(n_features)
+        
+        for i in range(self.student.n_iter):
+            # Update teacher
+            self._update_teacher()
+
+            # Compute gradients for both labeled and confident unlabeled data
+            dW, db = self._compute_combined_gradient(X_labeled, y_labeled, X_unlabeled)
+            
+            # Update student
+            self.student.weights -= self.student.learning_rate * dW
+            self.student.bias -= self.student.learning_rate * db
+
+            # Compute student loss
+            student_loss = self.student._compute_loss(X_labeled, y_labeled)
+
+            # Compute consistency loss
+            consistency_loss = self._consistency_loss(X_unlabeled)
+
+            # Combine losses
+            combined_loss = self.alpha_weight * student_loss + (1 - self.alpha_weight) * consistency_loss
+
+            if self.verbose and i % 100 == 0:
+                print(f"Iteration {i}: Combined Loss = {combined_loss}")
+
+    def predict(self, X):
+        return self.student.predict(X)
+
+    def predict_proba(self, X):
+        return self.student.predict_proba(X)
